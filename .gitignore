@@ -1,28 +1,6 @@
-# Python-generated files
+.venv/
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-.pytest_cache/
-.coverage
-htmlcov/
-*.log
-
-# Virtual environments
-.venv
-venv/
-env/
-
-# IDE settings
-.vscode/
-.idea/
-.DS_Store
-.history/
-
-# Project specific
+*.pyc
 downloads/
+.history/
 .env
-fanbox_extractor/drivers/__pycache__/
-fanbox_extractor/__pycache__/

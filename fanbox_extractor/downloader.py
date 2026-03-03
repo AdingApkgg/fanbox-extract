@@ -1,8 +1,11 @@
 import os
 import requests
 import concurrent.futures
+import threading
 from datetime import datetime
 from tqdm import tqdm
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from .utils import sanitize_filename
 from .extractor import LinkExtractor
 from .drivers import DriverManager
@@ -18,6 +21,9 @@ class FanboxDownloader:
         self.api_url = "https://api.fanbox.cc"
         self.extractor = LinkExtractor()
         self.driver_manager = DriverManager()
+        self.request_timeout = (10, 120)
+        self._stop_event = threading.Event()
+        self.session = self._build_session()
         
         if creator_id:
             self.creator_id = creator_id
@@ -29,11 +35,33 @@ class FanboxDownloader:
             os.makedirs(self.base_dir, exist_ok=True)
             print(f"Download directory: {self.base_dir}")
 
+    def _build_session(self):
+        session = requests.Session()
+        session.headers.update(self.headers)
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def request_stop(self):
+        self._stop_event.set()
+
+    def clear_stop(self):
+        self._stop_event.clear()
+
     def fetch_supporting_creators(self):
         """Fetch supporting creators list."""
         url = f"{self.api_url}/plan.listSupporting"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(url, timeout=self.request_timeout)
             response.raise_for_status()
             data = response.json()
             return data.get('body', [])
@@ -53,7 +81,7 @@ class FanboxDownloader:
         """Fetch supporting creators and ask user to select one."""
         url = f"{self.api_url}/plan.listSupporting"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(url, timeout=self.request_timeout)
             response.raise_for_status()
             data = response.json()
             
@@ -96,7 +124,7 @@ class FanboxDownloader:
         print(f"Fetching pagination info from {paginate_url}")
         
         try:
-            response = requests.get(paginate_url, headers=self.headers)
+            response = self.session.get(paginate_url, timeout=self.request_timeout)
             response.raise_for_status()
             data = response.json()
             page_urls = data.get('body', [])
@@ -131,7 +159,7 @@ class FanboxDownloader:
     def _fetch_page(self, url):
         """Helper to fetch a single page of posts."""
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(url, timeout=self.request_timeout)
             response.raise_for_status()
             data = response.json()
             items = data.get('body', [])
@@ -141,20 +169,17 @@ class FanboxDownloader:
             # print(f"Error fetching page {url}: {e}")
             return []
 
-    def download_file(self, url, filepath):
+    def download_file(self, url, filepath, skip_existing=True):
         """Download a single file."""
-        if os.path.exists(filepath):
-            # print(f"Skipping {os.path.basename(filepath)} (already exists)")
+        if skip_existing and os.path.exists(filepath):
             return filepath
 
         try:
-            # print(f"Downloading {os.path.basename(filepath)}...")
-            # Use stream=True to avoid loading large files into memory
-            # Increase chunk_size for better performance
-            response = requests.get(url, headers=self.headers, stream=True)
+            if self._stop_event.is_set():
+                return None
+            response = self.session.get(url, stream=True, timeout=self.request_timeout)
             response.raise_for_status()
             
-            # Detect extension from Content-Type if missing
             if not os.path.splitext(filepath)[1]:
                 content_type = response.headers.get('content-type', '')
                 if 'video/mp4' in content_type:
@@ -165,11 +190,9 @@ class FanboxDownloader:
                     filepath += '.png'
                 elif 'application/zip' in content_type:
                     filepath += '.zip'
-                # Add more mappings as needed
             
             total_size = int(response.headers.get('content-length', 0))
             
-            # Use larger buffer size for I/O
             with open(filepath, 'wb') as f, tqdm(
                 desc=os.path.basename(filepath),
                 total=total_size,
@@ -177,7 +200,9 @@ class FanboxDownloader:
                 unit_scale=True,
                 unit_divisor=1024,
             ) as bar:
-                for data in response.iter_content(chunk_size=1024 * 64): # 64KB chunks
+                for data in response.iter_content(chunk_size=1024 * 64):
+                    if self._stop_event.is_set():
+                        return None
                     size = f.write(data)
                     bar.update(size)
                     
@@ -185,15 +210,17 @@ class FanboxDownloader:
             print(f"Failed to download {url}: {e}")
             return None
         
-        return filepath # Return the final filepath (in case extension was added)
+        return filepath
 
-    def process_post(self, post_summary, callback=None):
+    def process_post(self, post_summary, callback=None, skip_existing=True, extract_archives=True):
         """Extract content from a post by fetching its details first.
         
         Args:
             post_summary: Post summary object
             callback: Optional function(msg) to report status
         """
+        if self._stop_event.is_set():
+            return
         post_id = post_summary.get('id')
         title = post_summary.get('title', 'No Title')
         msg = f"Processing: {title} ({post_id})"
@@ -219,7 +246,7 @@ class FanboxDownloader:
         # Fetch detailed post info
         detail_url = f"{self.api_url}/post.info?postId={post_id}"
         try:
-            response = requests.get(detail_url, headers=self.headers)
+            response = self.session.get(detail_url, timeout=self.request_timeout)
             
             # Handle 403 specifically
             if response.status_code == 403:
@@ -274,11 +301,13 @@ class FanboxDownloader:
         # Images
         if 'images' in body:
             for i, img in enumerate(body['images']):
+                if self._stop_event.is_set():
+                    return
                 url = img.get('originalUrl')
                 ext = os.path.splitext(url)[1]
                 filename = f"{post_id}_img_{i}{ext}"
                 filepath = os.path.join(post_dir, filename)
-                final_path = self.download_file(url, filepath)
+                final_path = self.download_file(url, filepath, skip_existing=skip_existing)
                 if final_path:
                     final_name = os.path.basename(final_path)
                     md_content.append(f"![{final_name}]({final_name})")
@@ -287,12 +316,14 @@ class FanboxDownloader:
         if 'files' in body:
             md_content.append("\n## Files")
             for file in body['files']:
+                if self._stop_event.is_set():
+                    return
                 url = file.get('url')
                 name = file.get('name')
                 ext = os.path.splitext(name)[1]
                 filename = f"{post_id}_file_{name}"
                 filepath = os.path.join(post_dir, filename)
-                final_path = self.download_file(url, filepath)
+                final_path = self.download_file(url, filepath, skip_existing=skip_existing)
                 if final_path:
                     final_name = os.path.basename(final_path)
                     md_content.append(f"- [{name}]({final_name})")
@@ -301,12 +332,14 @@ class FanboxDownloader:
         if 'fileMap' in body:
              md_content.append("\n## Files (Map)")
              for file_id, file in body['fileMap'].items():
+                if self._stop_event.is_set():
+                    return
                 url = file.get('url')
                 name = file.get('name')
                 ext = os.path.splitext(name)[1]
                 filename = f"{post_id}_file_{name}"
                 filepath = os.path.join(post_dir, filename)
-                final_path = self.download_file(url, filepath)
+                final_path = self.download_file(url, filepath, skip_existing=skip_existing)
                 if final_path:
                     final_name = os.path.basename(final_path)
                     md_content.append(f"- [{name}]({final_name})")
@@ -315,6 +348,8 @@ class FanboxDownloader:
         if 'blocks' in body:
             md_content.append("\n## Article Content")
             for block in body['blocks']:
+                if self._stop_event.is_set():
+                    return
                 btype = block.get('type')
                 if btype == 'p':
                     md_content.append(block.get('text', ''))
@@ -329,7 +364,7 @@ class FanboxDownloader:
                         ext = os.path.splitext(url)[1]
                         filename = f"{post_id}_block_{image_id}{ext}"
                         filepath = os.path.join(post_dir, filename)
-                        final_path = self.download_file(url, filepath)
+                        final_path = self.download_file(url, filepath, skip_existing=skip_existing)
                         if final_path:
                             final_name = os.path.basename(final_path)
                             md_content.append(f"![{final_name}]({final_name})")
@@ -342,7 +377,7 @@ class FanboxDownloader:
                         ext = os.path.splitext(name)[1]
                         filename = f"{post_id}_block_{name}"
                         filepath = os.path.join(post_dir, filename)
-                        final_path = self.download_file(url, filepath)
+                        final_path = self.download_file(url, filepath, skip_existing=skip_existing)
                         if final_path:
                             final_name = os.path.basename(final_path)
                             md_content.append(f"- [{name}]({final_name})")
@@ -355,33 +390,44 @@ class FanboxDownloader:
         # Scan for downloaded files to extract links (PDFs and Archives)
         extracted_links = {}
         
-        # Check PDFs
-        pdf_files = [f for f in os.listdir(post_dir) if f.lower().endswith('.pdf')]
-        for pdf_file in pdf_files:
-            filepath = os.path.join(post_dir, pdf_file)
-            links = self.extractor.extract_pdf_links(filepath)
-            if links:
-                extracted_links[pdf_file] = links
+        if extract_archives:
+            pdf_files = [f for f in os.listdir(post_dir) if f.lower().endswith('.pdf')]
+            for pdf_file in pdf_files:
+                if self._stop_event.is_set():
+                    return
+                filepath = os.path.join(post_dir, pdf_file)
+                links = self.extractor.extract_pdf_links(filepath)
+                if links:
+                    extracted_links[pdf_file] = links
 
-        # Check Archives
-        archive_extensions = ('.zip', '.rar', '.tar', '.gz')
-        archive_files = [f for f in os.listdir(post_dir) if f.lower().endswith(archive_extensions)]
-        for archive_file in archive_files:
-            filepath = os.path.join(post_dir, archive_file)
-            links = self.extractor.process_archive(filepath)
-            if links:
-                extracted_links[archive_file] = links
+            archive_extensions = ('.zip', '.rar', '.tar', '.gz')
+            archive_files = [f for f in os.listdir(post_dir) if f.lower().endswith(archive_extensions)]
+            for archive_file in archive_files:
+                if self._stop_event.is_set():
+                    return
+                filepath = os.path.join(post_dir, archive_file)
+                links = self.extractor.process_archive(filepath)
+                if links:
+                    extracted_links[archive_file] = links
 
         if extracted_links:
             md_content.append("\n## Extracted Resources")
             for source_file, links in sorted(extracted_links.items()):
+                if self._stop_event.is_set():
+                    return
                 md_content.append(f"\n### From `{source_file}`")
-                for link in links:
-                    downloaded = self.driver_manager.try_download(link, post_dir)
+                for link, access_code in links:
+                    downloaded, reason = self.driver_manager.try_download_detail(link, post_dir)
                     if downloaded:
-                        md_content.append(f"- [{link}]({link}) (Downloaded)")
+                        if access_code:
+                            md_content.append(f"- [{link}]({link}) (提取码: {access_code}) (Downloaded)")
+                        else:
+                            md_content.append(f"- [{link}]({link}) (Downloaded)")
                     else:
-                        md_content.append(f"- [{link}]({link})")
+                        if access_code:
+                            md_content.append(f"- [{link}]({link}) (提取码: {access_code}) (Not downloaded: {reason})")
+                        else:
+                            md_content.append(f"- [{link}]({link}) (Not downloaded: {reason})")
 
         # Save Markdown
         readme_path = os.path.join(post_dir, "README.md")
@@ -395,27 +441,43 @@ class FanboxDownloader:
         #     except OSError:
         #         pass
 
-    def run(self, progress_callback=None, status_callback=None, max_workers=5):
+    def run(self, progress_callback=None, status_callback=None, max_workers=5, skip_existing=True, extract_archives=True):
         if not self.creator_id:
             print("No creator selected.")
             return
 
+        self.clear_stop()
         posts = self.get_posts()
         print(f"Found {len(posts)} posts.")
         if status_callback: status_callback(f"Found {len(posts)} posts. Starting download...")
         
         total = len(posts)
+        if total == 0:
+            if progress_callback: progress_callback(1.0)
+            if status_callback: status_callback("No posts found.")
+            return
         completed = 0
         
         # Use ThreadPoolExecutor for concurrent processing
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Map futures to posts
             future_to_post = {
-                executor.submit(self.process_post, post, callback=status_callback): post 
+                executor.submit(
+                    self.process_post,
+                    post,
+                    callback=status_callback,
+                    skip_existing=skip_existing,
+                    extract_archives=extract_archives,
+                ): post 
                 for post in posts
             }
             
             for future in concurrent.futures.as_completed(future_to_post):
+                if self._stop_event.is_set():
+                    for pending in future_to_post:
+                        pending.cancel()
+                    if status_callback: status_callback("Download stopped by user.")
+                    break
                 post = future_to_post[future]
                 try:
                     future.result()
@@ -427,5 +489,6 @@ class FanboxDownloader:
                     completed += 1
                     if progress_callback: progress_callback(completed / total)
         
-        if progress_callback: progress_callback(1.0)
-        if status_callback: status_callback("Download complete!")
+        if not self._stop_event.is_set():
+            if progress_callback: progress_callback(1.0)
+            if status_callback: status_callback("Download complete!")
