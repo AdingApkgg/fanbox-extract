@@ -7,6 +7,8 @@ A powerful and user-friendly tool to download content from pixivFANBOX and Patre
 - **Multi-threaded Downloading**: Efficiently download multiple files concurrently.
 - **Multi-Platform Source**: Supports FANBOX API flow and Patreon RSS flow.
 - **Smart Extraction**: Automatically detects and extracts links from text, PDF files, and archives (zip, rar, tar, 7z, gz, bz2, xz).
+- **Intelligent Link Parsing**: Normalizes obfuscated links (`hxxp`, `[.]`, full-width symbols), extracts access codes, and trims noisy punctuation.
+- **Auto Archive Unpack**: Automatically unpacks downloaded archives into per-archive folders.
 - **External Link Support**: Built-in support for Google Drive, Mega.nz, Dropbox, OneDrive, MediaFire, and direct file links.
 - **Web UI**: A modern web interface powered by NiceGUI for easy interaction.
 - **Content Organization**: Organizes downloads by creator and post date/title.
@@ -72,7 +74,9 @@ WEB_UI_PASSWORD=YOUR_WEB_PASSWORD
 
 You can configure:
 - **Skip existing files**: Reuse previous downloads and save bandwidth.
-- **Extract links from archives**: Parse links in PDF/ZIP/RAR/TAR/GZ files.
+- **Extract links from archives**: Recursively parse links in PDF and archive files, including extracted subfolders.
+- **Intelligent content parsing**: Detect links and access codes from post text/HTML/content blocks before archive scanning.
+- **Auto extract archives to folder**: Recursively unpack downloaded archives into local folders after download.
 - **Parallel Downloads**: Control worker count for concurrent post processing.
 - **Stop**: Gracefully stop the current download task.
 
@@ -121,7 +125,8 @@ Environment variables are loaded from `.env` automatically for both `main.py` an
 
 ### Web UI Options
 - **Skip existing files**: Skip files that are already downloaded.
-- **Extract links from archives**: Extract links from downloaded archive and PDF files.
+- **Extract links from archives**: Recursively extract links from downloaded archives and PDF files, including nested levels.
+- **Auto extract archives to folder**: Automatically and recursively unpack downloaded archives into folders.
 - **Parallel Downloads**: Adjust the number of concurrent workers.
 - **Password Login**: Set `WEB_UI_PASSWORD` to require login for `/` and `/downloads`.
 
@@ -130,6 +135,26 @@ Environment variables are loaded from `.env` automatically for both `main.py` an
 - Patreon mode is based on RSS. Ensure your RSS URL has permission to access creator posts.
 - Some cloud drives require login, captcha, or anti-bot checks; unsupported links are still preserved in markdown.
 - When auto-download fails, generated post README records machine-readable failure reason codes.
+
+## Quality and Testing
+
+Run all test layers:
+
+```bash
+uv run python -m unittest discover -s tests -p "test_*.py"
+```
+
+The test suite includes:
+
+- Unit tests for core Web UI utility logic
+- Integration tests for file-tree and preview link flow
+- End-to-end HTTP smoke tests for auth and first-screen response time
+
+## Web UI Documentation
+
+- `docs/web-ui-architecture.md`: Architecture and performance strategy
+- `docs/component-library.md`: UI design tokens and component usage
+- `docs/testing.md`: Test layers and browser compatibility checklist
 
 ## How to get FANBOXSESSID
 
@@ -147,6 +172,9 @@ Environment variables are loaded from `.env` automatically for both `main.py` an
   - `extractor.py`: Link extraction logic (PDF, archives, compressed files).
   - `drivers.py`: Drivers for cloud links and direct files.
 - `web_ui.py`: NiceGUI-based web interface.
+- `fanbox_extractor/web_ui_core.py`: Reusable Web UI core utilities.
+- `tests/`: Unit, integration, and e2e test suites.
+- `docs/`: Web UI architecture, component, and testing docs.
 - `main.py`: CLI entry point.
 - `pyproject.toml`: Project configuration and dependencies.
 

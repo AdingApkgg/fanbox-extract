@@ -1,6 +1,40 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.mypy_cache/
+.pytest_cache/
+.hypothesize/
+
+# Project specific
 downloads/
 .history/
 .env
+.env.local
+
+# Node / JS / Web
+node_modules/
+.next/
+build/
+dist/
+out/
+.vercel/
+
+# System
+.DS_Store
+Thumbs.db

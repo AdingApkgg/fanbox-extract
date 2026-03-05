@@ -9,6 +9,7 @@ from urllib3.util.retry import Retry
 from .utils import sanitize_filename
 from .extractor import LinkExtractor
 from .drivers import DriverManager
+from .markdown_i18n import write_bilingual_readmes
 
 class FanboxDownloader:
     def __init__(self, sessid, creator_id=None):
@@ -123,6 +124,7 @@ class FanboxDownloader:
         paginate_url = f"{self.api_url}/post.paginateCreator?creatorId={self.creator_id}"
         print(f"Fetching pagination info from {paginate_url}")
         
+        page_urls = []
         try:
             response = self.session.get(paginate_url, timeout=self.request_timeout)
             response.raise_for_status()
@@ -130,11 +132,49 @@ class FanboxDownloader:
             page_urls = data.get('body', [])
         except Exception as e:
             print(f"Error fetching pagination: {e}")
-            return []
 
         if not page_urls:
-            print("No pagination URLs found. Trying to fetch the first page directly.")
-            page_urls = [f"{self.api_url}/post.listCreator?creatorId={self.creator_id}&limit=10"]
+            print("No pagination URLs found. Switching to manual pagination.")
+            next_url = f"{self.api_url}/post.listCreator?creatorId={self.creator_id}&limit=50"
+            seen_post_ids = set()
+            
+            while next_url:
+                if self._stop_event.is_set():
+                    break
+                print(f"Fetching list: {next_url}")
+                try:
+                    response = self.session.get(next_url, timeout=self.request_timeout)
+                    response.raise_for_status()
+                    data = response.json()
+                    items = data.get('body', [])
+                    
+                    if not items:
+                        break
+                    
+                    new_items = [p for p in items if p['id'] not in seen_post_ids]
+                    if not new_items:
+                        break
+                        
+                    posts.extend(new_items)
+                    for p in new_items:
+                        seen_post_ids.add(p['id'])
+                    
+                    last_post = items[-1]
+                    last_date = last_post.get('publishedDatetime')
+                    
+                    if not last_date:
+                        break
+                    
+                    next_url = f"{self.api_url}/post.listCreator?creatorId={self.creator_id}&limit=50&maxPublishedDatetime={last_date}"
+                    
+                except Exception as e:
+                    print(f"Error in manual pagination: {e}")
+                    break
+            
+            print(f"Manually found {len(posts)} posts.")
+            # Sort posts by date (newest first)
+            posts.sort(key=lambda x: x.get('publishedDatetime', ''), reverse=True)
+            return posts
 
         print(f"Found {len(page_urls)} pages.")
         
@@ -212,20 +252,27 @@ class FanboxDownloader:
         
         return filepath
 
-    def process_post(self, post_summary, callback=None, skip_existing=True, extract_archives=True):
-        """Extract content from a post by fetching its details first.
-        
-        Args:
-            post_summary: Post summary object
-            callback: Optional function(msg) to report status
-        """
+    def _merge_link_entries(self, merged_links, links):
+        for link, access_code in links:
+            if link not in merged_links:
+                merged_links[link] = access_code
+                continue
+            if merged_links[link] is None and access_code:
+                merged_links[link] = access_code
+
+    def process_post(
+        self,
+        post_summary,
+        callback=None,
+        skip_existing=True,
+        extract_archives=True,
+        auto_extract_archives=True,
+    ):
+        """Extract content from a post by fetching its details first."""
         if self._stop_event.is_set():
             return
         post_id = post_summary.get('id')
         title = post_summary.get('title', 'No Title')
-        msg = f"Processing: {title} ({post_id})"
-        if callback: callback(msg)
-        else: print(msg)
         
         published_date = post_summary.get('publishedDatetime', '')
         
@@ -242,6 +289,10 @@ class FanboxDownloader:
         folder_name = f"{date_str}_{sanitize_filename(title)}_{post_id}"
         post_dir = os.path.join(self.base_dir, folder_name)
         os.makedirs(post_dir, exist_ok=True)
+
+        msg = f"正在处理: {title} ({post_id})"
+        if callback: callback(msg)
+        else: print(msg)
 
         # Fetch detailed post info
         detail_url = f"{self.api_url}/post.info?postId={post_id}"
@@ -283,6 +334,7 @@ class FanboxDownloader:
 
         # --- Markdown Content Preparation ---
         md_content = []
+        content_links = []
         md_content.append(f"# {title}")
         md_content.append(f"**ID:** {post_id}  ")
         md_content.append(f"**Date:** {published_date}  ")
@@ -294,6 +346,7 @@ class FanboxDownloader:
             md_content.append("## Description")
             md_content.append(body['text'])
             md_content.append("\n")
+            content_links.extend(self.extractor.extract_text_links(body['text']))
 
         # Handle different post types and collect downloads
         md_content.append("## Gallery")
@@ -352,10 +405,18 @@ class FanboxDownloader:
                     return
                 btype = block.get('type')
                 if btype == 'p':
-                    md_content.append(block.get('text', ''))
+                    text_value = block.get('text', '')
+                    md_content.append(text_value)
+                    content_links.extend(self.extractor.extract_text_links(text_value))
                     md_content.append("") # Newline
                 elif btype == 'header':
-                    md_content.append(f"### {block.get('text', '')}")
+                    text_value = block.get('text', '')
+                    md_content.append(f"### {text_value}")
+                    content_links.extend(self.extractor.extract_text_links(text_value))
+                elif btype == 'quote':
+                    text_value = block.get('text', '')
+                    md_content.append(f"> {text_value}")
+                    content_links.extend(self.extractor.extract_text_links(text_value))
                 elif btype == 'image':
                     image_id = block.get('imageId')
                     if image_id and 'imageMap' in body and image_id in body['imageMap']:
@@ -385,30 +446,142 @@ class FanboxDownloader:
                     embed_id = block.get('embedId')
                     if embed_id and 'embedMap' in body and embed_id in body['embedMap']:
                         embed = body['embedMap'][embed_id]
-                        md_content.append(f"> **Embed:** [{embed.get('serviceProvider')}]({embed.get('contentUrl')})")
+                        embed_url = embed.get('contentUrl')
+                        md_content.append(f"> **Embed:** [{embed.get('serviceProvider')}]({embed_url})")
+                        normalized = self.extractor.normalize_url(embed_url or "")
+                        if normalized:
+                            content_links.append((normalized, None))
+                elif btype == 'url_embed':
+                    url_embed_id = block.get('urlEmbedId')
+                    if url_embed_id and 'urlEmbedMap' in body and url_embed_id in body['urlEmbedMap']:
+                        url_embed = body['urlEmbedMap'][url_embed_id]
+                        embed_url = url_embed.get('url') or url_embed.get('contentUrl')
+                        normalized = self.extractor.normalize_url(embed_url or "")
+                        if normalized:
+                            md_content.append(f"> **URL Embed:** [{normalized}]({normalized})")
+                            content_links.append((normalized, None))
+                elif btype == 'video':
+                    video_id = block.get('videoId')
+                    if video_id and 'videoMap' in body and video_id in body['videoMap']:
+                        video = body['videoMap'][video_id]
+                        video_url = video.get('url') or video.get('sourceUrl') or video.get('embedUrl')
+                        normalized = self.extractor.normalize_url(video_url or "")
+                        if normalized:
+                            md_content.append(f"> **Video:** [{normalized}]({normalized})")
+                            content_links.append((normalized, None))
+                elif block.get('text'):
+                    text_value = block.get('text', '')
+                    md_content.append(text_value)
+                    content_links.extend(self.extractor.extract_text_links(text_value))
 
-        # Scan for downloaded files to extract links (PDFs and Archives)
         extracted_links = {}
-        
-        if extract_archives:
-            pdf_files = [f for f in os.listdir(post_dir) if f.lower().endswith('.pdf')]
-            for pdf_file in pdf_files:
-                if self._stop_event.is_set():
-                    return
-                filepath = os.path.join(post_dir, pdf_file)
-                links = self.extractor.extract_pdf_links(filepath)
-                if links:
-                    extracted_links[pdf_file] = links
+        merged_content_codes = {}
+        ordered_content_urls = []
+        for link, access_code in content_links:
+            if link not in merged_content_codes:
+                ordered_content_urls.append(link)
+            self._merge_link_entries(merged_content_codes, [(link, access_code)])
+        if ordered_content_urls:
+            extracted_links["Post Content"] = [(url, merged_content_codes[url]) for url in ordered_content_urls]
 
-            archive_extensions = ('.zip', '.rar', '.tar', '.gz')
-            archive_files = [f for f in os.listdir(post_dir) if f.lower().endswith(archive_extensions)]
-            for archive_file in archive_files:
+        download_candidates = {}
+        self._merge_link_entries(download_candidates, extracted_links.get("Post Content", []))
+        download_results = {}
+        processed_resource_files = set()
+        extracted_archive_dirs = set()
+
+        while True:
+            if self._stop_event.is_set():
+                return
+
+            if auto_extract_archives:
+                new_dirs = self.extractor.extract_archives_recursively(
+                    post_dir,
+                    skip_existing=skip_existing,
+                    should_stop=self._stop_event.is_set,
+                )
+                if new_dirs:
+                    msg = f"  -> 解压了 {len(new_dirs)} 个归档文件"
+                    if callback: callback(msg)
+                    else: print(msg)
+                extracted_archive_dirs.update(new_dirs)
+
+            new_resource_scanned = False
+            if extract_archives:
+                pdf_files, archive_files = self.extractor.collect_resource_files(post_dir)
+                for pdf_file in pdf_files:
+                    if self._stop_event.is_set():
+                        return
+                    if pdf_file in processed_resource_files:
+                        continue
+                    processed_resource_files.add(pdf_file)
+                    new_resource_scanned = True
+                    filepath = os.path.join(post_dir, pdf_file)
+                    
+                    msg = f"  -> 正在扫描 PDF: {os.path.basename(pdf_file)}"
+                    if callback: callback(msg)
+                    else: print(msg)
+                    
+                    links = self.extractor.extract_pdf_links(filepath)
+                    if links:
+                        msg = f"     发现 {len(links)} 个链接"
+                        if callback: callback(msg)
+                        else: print(msg)
+                        extracted_links[pdf_file] = links
+                        self._merge_link_entries(download_candidates, links)
+
+                for archive_file in archive_files:
+                    if self._stop_event.is_set():
+                        return
+                    if archive_file in processed_resource_files:
+                        continue
+                    processed_resource_files.add(archive_file)
+                    new_resource_scanned = True
+                    filepath = os.path.join(post_dir, archive_file)
+                    
+                    msg = f"  -> 正在扫描压缩包: {os.path.basename(archive_file)}"
+                    if callback: callback(msg)
+                    else: print(msg)
+                    
+                    links = self.extractor.process_archive(filepath)
+                    if links:
+                        msg = f"     发现 {len(links)} 个链接"
+                        if callback: callback(msg)
+                        else: print(msg)
+                        extracted_links[archive_file] = links
+                        self._merge_link_entries(download_candidates, links)
+
+            new_download_count = 0
+            for link, access_code in list(download_candidates.items()):
                 if self._stop_event.is_set():
                     return
-                filepath = os.path.join(post_dir, archive_file)
-                links = self.extractor.process_archive(filepath)
-                if links:
-                    extracted_links[archive_file] = links
+                if link in download_results:
+                    continue
+                
+                msg = f"  -> 尝试下载外部链接: {link}"
+                if callback: callback(msg)
+                else: print(msg)
+                
+                downloaded, reason = self.driver_manager.try_download_detail(link, post_dir)
+                download_results[link] = (downloaded, reason, access_code)
+                if downloaded:
+                    msg = f"     下载成功"
+                    if callback: callback(msg)
+                    else: print(msg)
+                    new_download_count += 1
+                else:
+                    # Optional: Log failure reason if needed, but keep it clean for now
+                    pass
+
+            if not extract_archives:
+                break
+            if new_download_count == 0 and not new_resource_scanned:
+                break
+
+        if extracted_archive_dirs:
+            md_content.append("\n## Extracted Archives")
+            for directory in sorted({os.path.relpath(d, post_dir) for d in extracted_archive_dirs}):
+                md_content.append(f"- `{directory}`")
 
         if extracted_links:
             md_content.append("\n## Extracted Resources")
@@ -417,22 +590,27 @@ class FanboxDownloader:
                     return
                 md_content.append(f"\n### From `{source_file}`")
                 for link, access_code in links:
-                    downloaded, reason = self.driver_manager.try_download_detail(link, post_dir)
+                    downloaded, reason, final_access_code = download_results.get(
+                        link,
+                        (False, "not_attempted", access_code),
+                    )
+                    access_code_to_show = final_access_code if final_access_code is not None else access_code
                     if downloaded:
-                        if access_code:
-                            md_content.append(f"- [{link}]({link}) (提取码: {access_code}) (Downloaded)")
+                        if access_code_to_show:
+                            md_content.append(f"- [{link}]({link}) (提取码: {access_code_to_show}) (Downloaded)")
                         else:
                             md_content.append(f"- [{link}]({link}) (Downloaded)")
                     else:
-                        if access_code:
-                            md_content.append(f"- [{link}]({link}) (提取码: {access_code}) (Not downloaded: {reason})")
+                        if access_code_to_show:
+                            md_content.append(f"- [{link}]({link}) (提取码: {access_code_to_show}) (Not downloaded: {reason})")
                         else:
                             md_content.append(f"- [{link}]({link}) (Not downloaded: {reason})")
 
-        # Save Markdown
-        readme_path = os.path.join(post_dir, "README.md")
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(md_content))
+        write_bilingual_readmes(
+            post_dir=post_dir,
+            markdown_text="\n".join(md_content),
+            callback=callback,
+        )
             
         # Clean up processed archives if links were extracted (Optional, commented out for safety)
         # for archive_file in extracted_links.keys():
@@ -441,54 +619,53 @@ class FanboxDownloader:
         #     except OSError:
         #         pass
 
-    def run(self, progress_callback=None, status_callback=None, max_workers=5, skip_existing=True, extract_archives=True):
+    def run(
+        self,
+        progress_callback=None,
+        status_callback=None,
+        max_workers=5,
+        skip_existing=True,
+        extract_archives=True,
+        auto_extract_archives=True,
+    ):
         if not self.creator_id:
             print("No creator selected.")
             return
 
         self.clear_stop()
         posts = self.get_posts()
-        print(f"Found {len(posts)} posts.")
-        if status_callback: status_callback(f"Found {len(posts)} posts. Starting download...")
+        print(f"找到 {len(posts)} 篇帖子。")
+        if status_callback: status_callback(f"找到 {len(posts)} 篇帖子。开始下载...")
         
         total = len(posts)
         if total == 0:
             if progress_callback: progress_callback(1.0)
-            if status_callback: status_callback("No posts found.")
+            if status_callback: status_callback("没有找到帖子。")
             return
         completed = 0
         
-        # Use ThreadPoolExecutor for concurrent processing
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Map futures to posts
-            future_to_post = {
-                executor.submit(
-                    self.process_post,
+        # Process posts sequentially to ensure full resource extraction for each
+        for i, post in enumerate(posts):
+            if self._stop_event.is_set():
+                if status_callback: status_callback("用户停止下载。")
+                break
+                
+            try:
+                self.process_post(
                     post,
                     callback=status_callback,
                     skip_existing=skip_existing,
                     extract_archives=extract_archives,
-                ): post 
-                for post in posts
-            }
-            
-            for future in concurrent.futures.as_completed(future_to_post):
-                if self._stop_event.is_set():
-                    for pending in future_to_post:
-                        pending.cancel()
-                    if status_callback: status_callback("Download stopped by user.")
-                    break
-                post = future_to_post[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    msg = f"Error processing post {post.get('id')}: {e}"
-                    print(msg)
-                    if status_callback: status_callback(msg)
-                finally:
-                    completed += 1
-                    if progress_callback: progress_callback(completed / total)
+                    auto_extract_archives=auto_extract_archives,
+                )
+            except Exception as e:
+                msg = f"处理帖子 {post.get('id')} 时出错: {e}"
+                print(msg)
+                if status_callback: status_callback(msg)
+            finally:
+                completed += 1
+                if progress_callback: progress_callback(completed / total)
         
         if not self._stop_event.is_set():
             if progress_callback: progress_callback(1.0)
-            if status_callback: status_callback("Download complete!")
+            if status_callback: status_callback("下载完成！")

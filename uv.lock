@@ -538,28 +538,36 @@ name = "fanbox-extract"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "fastapi" },
     { name = "gdown" },
     { name = "mega-py" },
     { name = "nicegui" },
     { name = "py7zr" },
+    { name = "pydantic" },
     { name = "pypdf" },
     { name = "python-dotenv" },
     { name = "rarfile" },
     { name = "requests" },
     { name = "tqdm" },
+    { name = "uvicorn" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", specifier = ">=0.135.1" },
     { name = "gdown", specifier = ">=5.2.1" },
     { name = "mega-py", specifier = "==1.0.8" },
     { name = "nicegui", specifier = ">=3.8.0" },
     { name = "py7zr", specifier = ">=0.22.0" },
+    { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pypdf", specifier = ">=6.7.5" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "rarfile", specifier = ">=4.2" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "tqdm", specifier = ">=4.67.3" },
+    { name = "uvicorn", specifier = ">=0.41.0" },
+    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [[package]]

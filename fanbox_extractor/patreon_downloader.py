@@ -1,11 +1,11 @@
 import os
 import re
-import html
 import requests
 import threading
 import concurrent.futures
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter
@@ -13,6 +13,26 @@ from urllib3.util.retry import Retry
 from .utils import sanitize_filename
 from .extractor import LinkExtractor
 from .drivers import DriverManager
+from .markdown_i18n import write_bilingual_readmes
+
+
+class _PatreonHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
+        self.text_parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        attrs_dict = dict(attrs)
+        href = (attrs_dict.get("href") or "").strip()
+        if href:
+            self.links.append(href)
+
+    def handle_data(self, data):
+        if data:
+            self.text_parts.append(data)
 
 
 class PatreonDownloader:
@@ -61,19 +81,32 @@ class PatreonDownloader:
     def _extract_links_from_html(self, raw_html):
         if not raw_html:
             return []
-        text = html.unescape(raw_html)
-        href_links = re.findall(r'href=[\'"]([^\'"]+)[\'"]', text, flags=re.IGNORECASE)
-        plain_links = self._url_pattern.findall(text)
-        links = []
-        seen = set()
-        for link in href_links + plain_links:
-            if not link.startswith("http"):
+        parser = _PatreonHTMLParser()
+        try:
+            parser.feed(raw_html)
+            parser.close()
+        except Exception:
+            parser = _PatreonHTMLParser()
+        text_links = self.extractor.extract_text_links(" ".join(parser.text_parts))
+        html_links = parser.links + self._url_pattern.findall(raw_html)
+        ordered_urls = []
+        merged_codes = {}
+        for link, access_code in text_links:
+            if link not in merged_codes:
+                ordered_urls.append(link)
+                merged_codes[link] = access_code
                 continue
-            if link in seen:
+            if merged_codes[link] is None and access_code:
+                merged_codes[link] = access_code
+        for link in html_links:
+            normalized = self.extractor.normalize_url(link)
+            if not normalized:
                 continue
-            seen.add(link)
-            links.append(link)
-        return links
+            if normalized in merged_codes:
+                continue
+            ordered_urls.append(normalized)
+            merged_codes[normalized] = None
+        return [(url, merged_codes[url]) for url in ordered_urls]
 
     def get_posts(self):
         if not self.rss_url:
@@ -155,7 +188,22 @@ class PatreonDownloader:
         except Exception:
             return None
 
-    def process_post(self, post, callback=None, skip_existing=True, extract_archives=True):
+    def _merge_link_entries(self, merged_links, links):
+        for link, access_code in links:
+            if link not in merged_links:
+                merged_links[link] = access_code
+                continue
+            if merged_links[link] is None and access_code:
+                merged_links[link] = access_code
+
+    def process_post(
+        self,
+        post,
+        callback=None,
+        skip_existing=True,
+        extract_archives=True,
+        auto_extract_archives=True,
+    ):
         if self._stop_event.is_set():
             return
         post_id = sanitize_filename(post.get("id", "unknown"))
@@ -191,58 +239,112 @@ class PatreonDownloader:
             else:
                 md_content.append(f"- {link}")
 
+        extracted_links = {}
         links = post.get("links", [])
         if links:
-            md_content.append("\n## Extracted Links")
-            for link in links:
+            extracted_links["Post Content"] = links
+
+        download_candidates = {}
+        self._merge_link_entries(download_candidates, extracted_links.get("Post Content", []))
+        download_results = {}
+        processed_resource_files = set()
+        extracted_archive_dirs = set()
+
+        while True:
+            if self._stop_event.is_set():
+                return
+
+            if auto_extract_archives:
+                new_dirs = self.extractor.extract_archives_recursively(
+                    post_dir,
+                    skip_existing=skip_existing,
+                    should_stop=self._stop_event.is_set,
+                )
+                extracted_archive_dirs.update(new_dirs)
+
+            new_resource_scanned = False
+            if extract_archives:
+                pdf_files, archive_files = self.extractor.collect_resource_files(post_dir)
+                for pdf_file in pdf_files:
+                    if self._stop_event.is_set():
+                        return
+                    if pdf_file in processed_resource_files:
+                        continue
+                    processed_resource_files.add(pdf_file)
+                    new_resource_scanned = True
+                    links_from_pdf = self.extractor.extract_pdf_links(os.path.join(post_dir, pdf_file))
+                    if links_from_pdf:
+                        extracted_links[pdf_file] = links_from_pdf
+                        self._merge_link_entries(download_candidates, links_from_pdf)
+                for archive_file in archive_files:
+                    if self._stop_event.is_set():
+                        return
+                    if archive_file in processed_resource_files:
+                        continue
+                    processed_resource_files.add(archive_file)
+                    new_resource_scanned = True
+                    links_from_archive = self.extractor.process_archive(os.path.join(post_dir, archive_file))
+                    if links_from_archive:
+                        extracted_links[archive_file] = links_from_archive
+                        self._merge_link_entries(download_candidates, links_from_archive)
+
+            new_download_count = 0
+            for link, access_code in list(download_candidates.items()):
                 if self._stop_event.is_set():
                     return
+                if link in download_results:
+                    continue
                 downloaded, reason = self.driver_manager.try_download_detail(link, post_dir)
+                download_results[link] = (downloaded, reason, access_code)
                 if downloaded:
-                    md_content.append(f"- [{link}]({link}) (Downloaded)")
-                else:
-                    md_content.append(f"- [{link}]({link}) (Not downloaded: {reason})")
+                    new_download_count += 1
 
-        if extract_archives:
-            extracted_links = {}
-            entries = os.listdir(post_dir)
-            pdf_files = [f for f in entries if f.lower().endswith(".pdf")]
-            archive_files = [
-                f
-                for f in entries
-                if f.lower().endswith(
-                    (".zip", ".rar", ".tar", ".gz", ".7z", ".bz2", ".xz", ".tgz", ".tbz2", ".txz")
-                )
-            ]
-            for pdf_file in pdf_files:
-                links_from_pdf = self.extractor.extract_pdf_links(os.path.join(post_dir, pdf_file))
-                if links_from_pdf:
-                    extracted_links[pdf_file] = links_from_pdf
-            for archive_file in archive_files:
-                links_from_archive = self.extractor.process_archive(os.path.join(post_dir, archive_file))
-                if links_from_archive:
-                    extracted_links[archive_file] = links_from_archive
-            if extracted_links:
-                md_content.append("\n## Extracted Resources")
-                for source_file, links_list in sorted(extracted_links.items()):
-                    md_content.append(f"\n### From `{source_file}`")
-                    for link, access_code in links_list:
-                        downloaded, reason = self.driver_manager.try_download_detail(link, post_dir)
-                        if downloaded:
-                            if access_code:
-                                md_content.append(f"- [{link}]({link}) (提取码: {access_code}) (Downloaded)")
-                            else:
-                                md_content.append(f"- [{link}]({link}) (Downloaded)")
+            if not extract_archives:
+                break
+            if new_download_count == 0 and not new_resource_scanned:
+                break
+
+        if extracted_archive_dirs:
+            md_content.append("\n## Extracted Archives")
+            for directory in sorted({os.path.relpath(d, post_dir) for d in extracted_archive_dirs}):
+                md_content.append(f"- `{directory}`")
+
+        if extracted_links:
+            md_content.append("\n## Extracted Resources")
+            for source_file, links_list in sorted(extracted_links.items()):
+                md_content.append(f"\n### From `{source_file}`")
+                for link, access_code in links_list:
+                    downloaded, reason, final_access_code = download_results.get(
+                        link,
+                        (False, "not_attempted", access_code),
+                    )
+                    access_code_to_show = final_access_code if final_access_code is not None else access_code
+                    if downloaded:
+                        if access_code_to_show:
+                            md_content.append(f"- [{link}]({link}) (提取码: {access_code_to_show}) (Downloaded)")
                         else:
-                            if access_code:
-                                md_content.append(f"- [{link}]({link}) (提取码: {access_code}) (Not downloaded: {reason})")
-                            else:
-                                md_content.append(f"- [{link}]({link}) (Not downloaded: {reason})")
+                            md_content.append(f"- [{link}]({link}) (Downloaded)")
+                    else:
+                        if access_code_to_show:
+                            md_content.append(f"- [{link}]({link}) (提取码: {access_code_to_show}) (Not downloaded: {reason})")
+                        else:
+                            md_content.append(f"- [{link}]({link}) (Not downloaded: {reason})")
 
-        with open(os.path.join(post_dir, "README.md"), "w", encoding="utf-8") as f:
-            f.write("\n".join(md_content))
+        write_bilingual_readmes(
+            post_dir=post_dir,
+            markdown_text="\n".join(md_content),
+            callback=callback,
+        )
 
-    def run(self, progress_callback=None, status_callback=None, max_workers=5, skip_existing=True, extract_archives=True):
+    def run(
+        self,
+        progress_callback=None,
+        status_callback=None,
+        max_workers=5,
+        skip_existing=True,
+        extract_archives=True,
+        auto_extract_archives=True,
+    ):
         self.clear_stop()
         posts = self.get_posts()
         total = len(posts)
@@ -264,6 +366,7 @@ class PatreonDownloader:
                     callback=status_callback,
                     skip_existing=skip_existing,
                     extract_archives=extract_archives,
+                    auto_extract_archives=auto_extract_archives,
                 ): post
                 for post in posts
             }
